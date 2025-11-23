@@ -1,0 +1,420 @@
+mini-hids/
+├─ README.md
+├─ LICENSE
+├─ requirements.txt
+├─ config.yaml
+├─ main.py
+├─ file_monitor.py
+├─ process_monitor.py
+├─ log_monitor.py
+├─ port_check.py
+├─ utils.py
+└─ tests/
+   ├─ test_file_monitor.py
+   └─ test_utils.py
+
+PyYAML>=6.0
+psutil>=5.9.0
+watchdog>=3.0.0
+pytest>=7.0.0
+
+# Directories to monitor for file integrity (hash baseline will be created on first run)
+file_monitor:
+  paths:
+    - ./watched_dir
+  hash_algo: sha256
+  baseline_file: ./baseline.json
+  alert_on_new: true
+  alert_on_deleted: true
+  alert_on_modified: true
+
+# Process monitoring
+process_monitor:
+  allowed_processes:
+    - python
+    - sshd
+    - systemd
+    - cron
+  check_interval_seconds: 10
+
+# Log monitoring (tail file, match regex patterns considered suspicious)
+log_monitor:
+  files:
+    - /var/log/auth.log       # adjust to your system or use a test log file
+  patterns:
+    - 'Failed password'
+    - 'authentication failure'
+    - 'Invalid user'
+  check_interval_seconds: 5
+
+# Port check (for defensive verification; only use on hosts you control)
+port_check:
+  hosts:
+    - host: 127.0.0.1
+      ports: [22, 80]
+  timeout_seconds: 1
+
+# utils.py
+import hashlib
+import json
+import os
+from typing import Dict
+
+def compute_hash(path: str, algo: str = "sha256") -> str:
+    h = hashlib.new(algo)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def load_json(path: str) -> Dict:
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_json(path: str, data: Dict):
+    dirname = os.path.dirname(path)
+    if dirname and not os.path.exists(dirname):
+        os.makedirs(dirname, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+# file_monitor.py
+import os
+import time
+from typing import List, Dict
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from utils import compute_hash, load_json, save_json
+
+class Baseline:
+    def __init__(self, baseline_file: str, algo: str = "sha256"):
+        self.baseline_file = baseline_file
+        self.algo = algo
+        self.map = load_json(baseline_file)  # {path: hash}
+
+    def update(self, path: str, h: str):
+        self.map[path] = h
+        save_json(self.baseline_file, self.map)
+
+    def remove(self, path: str):
+        if path in self.map:
+            del self.map[path]
+            save_json(self.baseline_file, self.map)
+
+    def get(self, path: str):
+        return self.map.get(path)
+
+class FileMonitorHandler(FileSystemEventHandler):
+    def __init__(self, baseline: Baseline, alerts: callable):
+        super().__init__()
+        self.baseline = baseline
+        self.alerts = alerts
+
+    def handle_change(self, path: str, event_type: str):
+        if not os.path.isfile(path):
+            return
+        h = compute_hash(path, self.baseline.algo)
+        old = self.baseline.get(path)
+        if old is None:
+            self.alerts(f"[NEW FILE] {path} (hash={h})")
+            self.baseline.update(path, h)
+        elif old != h:
+            self.alerts(f"[MODIFIED] {path} (old={old[:8]}..., new={h[:8]}...)")
+            self.baseline.update(path, h)
+
+    def on_created(self, event):
+        self.handle_change(event.src_path, "created")
+
+    def on_modified(self, event):
+        self.handle_change(event.src_path, "modified")
+
+    def on_deleted(self, event):
+        path = event.src_path
+        if self.baseline.get(path):
+            self.alerts(f"[DELETED] {path}")
+            self.baseline.remove(path)
+
+class FileMonitor:
+    def __init__(self, paths: List[str], baseline_file: str, algo: str, alerts: callable):
+        self.paths = paths
+        self.baseline = Baseline(baseline_file, algo)
+        self.alerts = alerts
+        self.observer = Observer()
+
+    def build_baseline_if_empty(self):
+        if not self.baseline.map:
+            self.alerts("[BASELINE] Building baseline for monitored paths...")
+            for p in self.paths:
+                for root, _, files in os.walk(p):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        try:
+                            h = compute_hash(fp, self.baseline.algo)
+                            self.baseline.update(fp, h)
+                        except (PermissionError, FileNotFoundError):
+                            continue
+            self.alerts("[BASELINE] Baseline built.")
+
+    def start(self):
+        self.build_baseline_if_empty()
+        handler = FileMonitorHandler(self.baseline, self.alerts)
+        for p in self.paths:
+            if os.path.exists(p):
+                self.observer.schedule(handler, p, recursive=True)
+        self.observer.start()
+
+    def stop(self):
+        self.observer.stop()
+        self.observer.join()
+
+# process_monitor.py
+import psutil
+import time
+from typing import Callable, List, Set
+
+class ProcessMonitor:
+    def __init__(self, allowed: List[str], interval: int, alerts: Callable[[str], None]):
+        self.allowed = set(n.lower() for n in allowed)
+        self.interval = interval
+        self.alerts = alerts
+        self._running = False
+
+    def check_once(self):
+        seen: Set[str] = set()
+        for p in psutil.process_iter(['name', 'exe', 'cmdline']):
+            try:
+                name = (p.info['name'] or "").lower()
+                if name:
+                    seen.add(name)
+                    if name not in self.allowed:
+                        self.alerts(f"[UNEXPECTED PROCESS] {name} (pid={p.pid}) cmd={p.info.get('cmdline')}")
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        # optional: detect allowed processes missing (could be important)
+        # Example: if you want to ensure sshd present:
+        # for must in ('sshd',):
+        #     if must not in seen:
+        #         self.alerts(f"[MISSING] {must} not running")
+
+    def start(self):
+        self._running = True
+        while self._running:
+            self.check_once()
+            time.sleep(self.interval)
+
+    def stop(self):
+        self._running = False
+
+
+# log_monitor.py
+import time
+import re
+from typing import List, Callable
+
+class LogMonitor:
+    def __init__(self, files: List[str], patterns: List[str], interval: int, alerts: Callable[[str], None]):
+        self.files = files
+        self.patterns = [re.compile(p, re.IGNORECASE) for p in patterns]
+        self.interval = interval
+        self.alerts = alerts
+        self.positions = {}
+
+    def tail_once(self, path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                f.seek(self.positions.get(path, 0))
+                for line in f:
+                    for pat in self.patterns:
+                        if pat.search(line):
+                            self.alerts(f"[LOG MATCH] {path}: {line.strip()}")
+                self.positions[path] = f.tell()
+        except FileNotFoundError:
+            # ignore missing log files
+            return
+
+    def start(self):
+        while True:
+            for p in self.files:
+                self.tail_once(p)
+            time.sleep(self.interval)
+
+
+# port_check.py
+import socket
+from typing import List, Dict
+
+def check_port(host: str, port: int, timeout: float = 1.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+def run_checks(hosts: List[Dict], timeout: float = 1.0):
+    results = []
+    for h in hosts:
+        hostname = h["host"]
+        for p in h.get("ports", []):
+            up = check_port(hostname, int(p), timeout)
+            results.append((hostname, p, up))
+    return results
+
+# main.py
+import threading
+import yaml
+import time
+import logging
+from file_monitor import FileMonitor
+from process_monitor import ProcessMonitor
+from log_monitor import LogMonitor
+from port_check import run_checks
+
+LOGFILE = "mini-hids.log"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s", filename=LOGFILE)
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+logging.getLogger().addHandler(console)
+
+def alert(msg: str):
+    logging.info(msg)
+    # place to expand: send email, webhook, Slack, etc.
+
+def load_config(path="config.yaml"):
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+def start_file_monitor(cfg):
+    fm_cfg = cfg.get("file_monitor", {})
+    fm = FileMonitor(paths=fm_cfg.get("paths", []),
+                     baseline_file=fm_cfg.get("baseline_file", "./baseline.json"),
+                     algo=fm_cfg.get("hash_algo", "sha256"),
+                     alerts=alert)
+    fm.start()
+    return fm
+
+def start_process_monitor(cfg):
+    pm_cfg = cfg.get("process_monitor", {})
+    pm = ProcessMonitor(allowed=pm_cfg.get("allowed_processes", []),
+                        interval=pm_cfg.get("check_interval_seconds", 10),
+                        alerts=alert)
+    t = threading.Thread(target=pm.start, daemon=True)
+    t.start()
+    return pm
+
+def start_log_monitor(cfg):
+    lm_cfg = cfg.get("log_monitor", {})
+    lm = LogMonitor(files=lm_cfg.get("files", []),
+                    patterns=lm_cfg.get("patterns", []),
+                    interval=lm_cfg.get("check_interval_seconds", 5),
+                    alerts=alert)
+    t = threading.Thread(target=lm.start, daemon=True)
+    t.start()
+    return lm
+
+def run_port_checks(cfg):
+    pc_cfg = cfg.get("port_check", {})
+    hosts = pc_cfg.get("hosts", [])
+    timeout = pc_cfg.get("timeout_seconds", 1)
+    results = run_checks(hosts, timeout)
+    for host, port, up in results:
+        alert(f"[PORT] {host}:{port} -> {'open' if up else 'closed'}")
+
+def main():
+    cfg = load_config()
+    fm = start_file_monitor(cfg)
+    pm = start_process_monitor(cfg)
+    lm = start_log_monitor(cfg)
+    # run a single port-check on startup
+    run_port_checks(cfg)
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        fm.stop()
+        pm.stop()
+        alert("Shutting down")
+
+if __name__ == "__main__":
+    main()
+
+
+# tests/test_utils.py
+import os
+from utils import compute_hash, save_json, load_json
+import tempfile
+import json
+
+def test_compute_hash_and_json(tmp_path):
+    f = tmp_path / "a.txt"
+    f.write_text("hello")
+    h = compute_hash(str(f), algo="sha256")
+    assert len(h) == 64
+
+    jf = tmp_path / "b.json"
+    save_json(str(jf), {"x": 1})
+    d = load_json(str(jf))
+    assert d["x"] == 1
+
+
+# tests/test_file_monitor.py
+import tempfile
+import os
+from file_monitor import Baseline
+from utils import compute_hash
+
+def test_baseline_roundtrip(tmp_path):
+    basefile = tmp_path / "base.json"
+    p = tmp_path / "watched"
+    p.mkdir()
+    f = p / "t.txt"
+    f.write_text("v1")
+    b = Baseline(str(basefile), algo="sha256")
+    # simulate baseline update
+    h = compute_hash(str(f), "sha256")
+    b.update(str(f), h)
+    assert b.get(str(f)) == h
+    b.remove(str(f))
+    assert b.get(str(f)) is None
+
+# mini-hids
+
+Lightweight Host Intrusion Detection System (HIDS) for learning and basic host monitoring.
+
+## Features
+- File integrity monitoring with baseline
+- Process monitoring to detect unexpected processes
+- Log monitoring (tail + regex alerting)
+- Limited port check (for verifying services on systems you control)
+- Local alerting to console + log file (mini-hids.log)
+
+## Requirements
+- Python 3.9+
+- Install deps:
+
+
+## Configuration
+Edit `config.yaml` to set monitored directories, allowed processes, log files, and port checks.
+
+## Running
+
+
+Stop with Ctrl-C.
+
+## Extending
+- Add email or webhook alerting in `main.alert`.
+- Replace console logging with structured logging or a SIEM connector.
+- Add rules engine for whitelisting/blacklisting at file/path level.
+
+## Tests
+
+
+## Legal / Ethical
+Use only on systems you own or have explicit authorization to test. Scanning other systems without permission may be illegal.
+
+
+
+
+
