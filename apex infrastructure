@@ -1,4 +1,4 @@
-GRAVITY
+
 pkg install bat
 pkg install bc
 pkg install clang
