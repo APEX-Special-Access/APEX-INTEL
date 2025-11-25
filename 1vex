@@ -1,0 +1,13 @@
+pkg install geoip2-database
+pkg install id3v2
+pkg install imlib2-static
+pkg install liblightning
+pkg install libsignal-protocol-c
+pkg install libt3key
+pkg install lighthttpd
+pkg install llvmgold
+pkg install magic-wormhole-rs
+pkg install build-essential
+pkg install git
+pkg install golang
+pkg install cmake
